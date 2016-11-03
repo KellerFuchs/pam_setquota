@@ -1,7 +1,6 @@
 #![feature(libc)]
 #![allow(unused_variables)]
 extern crate libc;
-#[macro_use] extern crate mdo;
 extern crate nix;
 extern crate users;
 extern crate pam;
@@ -21,66 +20,60 @@ use nix::sys::quota::quota;
 pub extern fn pam_sm_open_session(pamh: &module::PamHandleT, flags: PamFlag,
                                   argc: c_int, argv: *mut *const c_char
 ) -> PamResultCode {
-    use mdo::result::{bind,ret};
+    let args = unsafe { translate_args(argc, argv) };
+
+    session_aux(args, &pamh)
+        .unwrap_or_else(|(e, msg)|
+                        // We cheerfully ignore errors in logging to syslog,
+                        // since there is nothing we can do about it.
+                        let writer = try!(syslog::unix(Facility::LOG_AUTH));
+                        let result = try!(writer.send_3164(Severity::LOG_ALERT, &format!("pam_setquota: {}", msg)));
+                        e
+        )
+}
+
+fn session_aux<'a>(args: &'a Vec<String>, pamh: &'a module::PamHandleT) -> Result<PamResultCode, (PamResultCode, Cow<'a, String>)> {
     use users::os::unix::UserExt;
     use mnt::get_mount;
     use nix::sys::quota::quotactl_set;
 
-    let args = unsafe { translate_args(argc, argv) };
+    // Get the username from PAM
+    let username = try!(module::get_user(pamh, None)
+                        .map_err(|e| (e, Cow::from("Failed to get username"))));
 
-    // We use the Result<_, pam::constant> monad:
-    //  if something triggers an error, it has an associated pam::constant value
-    //  and processing stop (we go to .unwrap_or_else() and log the error)
-    (mdo! {
-        // Get the username from PAM
-        username =<< module::get_user(pamh, None)
-            .map_err(|e| (e, Cow::from("Failed to get username")));
+    // Get the user object from the passwd db
+    let user = try!(users::get_user_by_name(&username)
+                    .ok_or((PAM_USER_UNKNOWN, Cow::from("Unknown user"))));
 
-        // Get the user object from the passwd db
-        user =<< users::get_user_by_name(&username)
-            .ok_or((PAM_USER_UNKNOWN, Cow::from("Unknown user")));
-
-        // If this is a system user (uid < 1000), bail out early with PAM_SUCCESS
-        () =<< if user.uid() < 1000 { Err((PAM_SUCCESS, Cow::from(""))) } else { Ok(()) };
+    // If this is a system user (uid < 1000), bail out early with PAM_SUCCESS
+    if user.uid() < 1000 {
+        return Ok(PAM_SUCCESS)
+    };
 
 
-        // Parse the module's arguments.
-        // It is done late to avoid erroring out if the user has uid < 1000
-        quota =<< parse_args(&args)
-            .map_err(|s| (PAM_SESSION_ERR, Cow::from(format!("Failed to parse {}", s))));
+    // Parse the module's arguments.
+    // It is done late to avoid erroring out if the user has uid < 1000
+    let quota = try!(parse_args(&args)
+                     .map_err(|s| (PAM_SESSION_ERR, Cow::from(format!("Failed to parse {}", s)))));
 
+    
+    // Get the user's homedir mountpoint.
+    // Somehow, this requires unwrapping twice (yay for silly APIs!)
+    let mount_err = (PAM_SESSION_ERR, Cow::from("Couldn't get the homedir's mountpoint"));
 
-        // Get the user's homedir mountpoint.
-        // Somehow, this requires unwrapping twice (yay for silly APIs!)
-        home_opt =<< get_mount(user.home_dir())
-            .or(Err((PAM_SESSION_ERR, Cow::from("Couldn't get the homedir's mountpoint"))));
+    let home_opt = try!(get_mount(user.home_dir()).or(Err(mount_err)));
+    let home = try!(home_opt.ok_or(mount_err));
 
-        home =<< home_opt
-            .ok_or((PAM_SESSION_ERR, Cow::from("Couldn't get the homedir's mountpoint")));
+    
+    // Perform the actual quotactl(2) call
+    try!(quotactl_set(quota::USRQUOTA,
+                      &home.file,
+                      user.uid() as i32,
+                      &quota)
+         .or(Err((PAM_SESSION_ERR, Cow::from("Failed to set quota")))));
 
-
-        // Perform the actual quotactl(2) call
-        () =<< quotactl_set(quota::USRQUOTA,
-                            &home.file,
-                            user.uid() as i32,
-                            &quota)
-            .or(Err((PAM_SESSION_ERR, Cow::from("Failed to set quota"))));
-
-        ret Ok(PAM_SUCCESS)
-    }).unwrap_or_else(|(e, msg)|
-                      if e != PAM_SUCCESS {
-                          // We cheerfully ignore errors in logging to syslog,
-                          // since there is nothing we can do about it.
-                          mdo! {
-                              writer =<< syslog::unix(Facility::LOG_AUTH);
-                              result =<< writer.send_3164(Severity::LOG_ALERT, &format!("pam_setquota: {}", msg));
-                              ret Ok(result)
-                          };
-                          e
-                      } else { e }
-    )
+    return Ok(PAM_SUCCESS);
 }
-
 
 // parse_args returns either a quota::Dqblk struct
 //  or the string that failed to parse.
@@ -91,7 +84,7 @@ fn parse_args<'a>(args: &'a Vec<String>) -> Result<quota::Dqblk, Cow<'a, str> > 
     // The default quota value
     // It isn't quota::Dqblk::default() directly because
     //  the documentation doesn't state what the default value is.
-    let quota0 = quota::Dqblk {
+    let quota = quota::Dqblk {
         valid: QuotaValidFlags::empty(),
         .. quota::Dqblk::default()
     };
@@ -107,32 +100,27 @@ fn parse_args<'a>(args: &'a Vec<String>) -> Result<quota::Dqblk, Cow<'a, str> > 
 
     // We fold over the arguments, updating the quota value as we go.
     // Again, the Result<> monad is used to error-out early.
-    args.iter().fold(Ok(quota0),
-                     |res, s| {
-                         use mdo::result::{bind,ret};
-                         use nom::IResult::Done;
-                         mdo! {
-                             quota0 =<< res;
-                             // TODO: This is horrible; check why parse cannot be deconstructed
-                             parse =<< match arg(s) {
-                                 Done(_, o) => Ok(o),
-                                 _ => Err(Cow::from(s.as_str()))
-                             };
-                             ret match parse.0 {
-                                 "blocks" => Ok(quota::Dqblk {
-                                     bsoftlimit: parse.1,
-                                     bhardlimit: parse.2,
-                                     valid:      quota0.valid | QIF_BLIMITS,
-                                     .. quota0
-                                 }),
-                                 "inodes" => Ok(quota::Dqblk {
-                                     isoftlimit: parse.1,
-                                     ihardlimit: parse.2,
-                                     valid:      quota0.valid | QIF_ILIMITS,
-                                     .. quota0
-                                 }),
-                                 _ => Err(Cow::from(s.as_str()))
-                             }
+    args.iter().fold(Ok(quota),
+                     |quota, s| {
+                         let quota = try!(quota);
+                         let (keyword, soft, hard) = try!(match arg(s) {
+                             Done(_, o) => Ok(o),
+                             _ => Err(Cow::from(s.as_str()))
+                         });
+                         match keyword {
+                             "blocks" => Ok(quota::Dqblk {
+                                 bsoftlimit: soft,
+                                 bhardlimit: hard,
+                                 valid:      quota.valid | QIF_BLIMITS,
+                                 .. quota
+                             }),
+                             "inodes" => Ok(quota::Dqblk {
+                                 isoftlimit: soft,
+                                 ihardlimit: hard,
+                                 valid:      quota.valid | QIF_ILIMITS,
+                                 .. quota
+                             }),
+                             _ => return Err(Cow::from(s.as_str()))
                          }
                      }
     )
